@@ -13,6 +13,7 @@ import "@chainlink/contracts/src/v0.8/interfaces/AggregatorV3Interface.sol";
 import "./interfaces/ITraderSet.sol";
 import "./interfaces/IUniswapV2Router02.sol";
 import "./interfaces/ISwanSettings.sol";
+import "./interfaces/aave/ILendingPool.sol";
 
 contract Lake is Initializable, OwnableUpgradeable, ReentrancyGuardUpgradeable, PausableUpgradeable {
     using SafeERC20 for IERC20;
@@ -34,6 +35,8 @@ contract Lake is Initializable, OwnableUpgradeable, ReentrancyGuardUpgradeable, 
     uint256 public totalValue; // $ value
 
     address public investor; // $ investor can deposit/withdraw only
+
+    ILendingPool public aavePool;
 
     event RouterAdded(address router);
     event RouterRemoved(address router);
@@ -101,6 +104,12 @@ contract Lake is Initializable, OwnableUpgradeable, ReentrancyGuardUpgradeable, 
         require(address(_investor) != address(0), "Invalid");
 
         investor = _investor;
+    }
+
+    function setAavePool(ILendingPool _aavePool) external onlyOwner {
+        require(address(_aavePool) != address(0), "Invalid");
+
+        aavePool = _aavePool;
     }
 
     function getRouters() external view returns (address[] memory) {
@@ -262,6 +271,68 @@ contract Lake is Initializable, OwnableUpgradeable, ReentrancyGuardUpgradeable, 
         IUniswapV2Router02(router1).swapExactTokensForTokens(amountIn, 0, path1, address(this), block.timestamp);
 
         emit TradingDone(msg.sender, path1, router1, amountIn);
+    }
+
+    /**
+     * @dev Deposits an `amount` of underlying asset into the reserve, receiving in return overlying aTokens.
+     * - E.g. User deposits 100 USDC and gets in return 100 aUSDC
+     * @param asset The address of the underlying asset to deposit
+     * @param amount The amount to be deposited
+     **/
+    function aaveDeposit(address asset, uint256 amount) external onlyTrader nonReentrant whenNotPaused epochActive {
+        if (IERC20(asset).allowance(address(aavePool), address(this)) < amount) {
+            IERC20(asset).safeApprove(address(aavePool), amount);
+        }
+        aavePool.deposit(asset, amount, address(this), 0);
+    }
+
+    /**
+     * @notice Withdraws an `amount` of underlying asset from the reserve, burning the equivalent aTokens owned
+     * E.g. User has 100 aUSDC, calls withdraw() and receives 100 USDC, burning the 100 aUSDC
+     * @param asset The address of the underlying asset to withdraw
+     * @param amount The underlying amount to be withdrawn
+     *   - Send the value type(uint256).max in order to withdraw the whole aToken balance
+     **/
+    function aaveWithdraw(address asset, uint256 amount) external onlyTrader nonReentrant whenNotPaused epochActive {
+        aavePool.withdraw(asset, amount, address(this));
+    }
+
+    /**
+     * @notice Allows users to borrow a specific `amount` of the reserve underlying asset, provided that the borrower
+     * already supplied enough collateral, or he was given enough allowance by a credit delegator on the
+     * corresponding debt token (StableDebtToken or VariableDebtToken)
+     * - E.g. User borrows 100 USDC passing as `onBehalfOf` his own address, receiving the 100 USDC in his wallet
+     *   and 100 stable/variable debt tokens, depending on the `interestRateMode`
+     * @param asset The address of the underlying asset to borrow
+     * @param amount The amount to be borrowed
+     * @param interestRateMode The interest rate mode at which the user wants to borrow: 1 for Stable, 2 for Variable
+     * if he has been given credit delegation allowance
+     **/
+    function aaveBorrow(
+        address asset,
+        uint256 amount,
+        uint256 interestRateMode
+    ) external onlyTrader nonReentrant whenNotPaused epochActive {
+        aavePool.borrow(asset, amount, interestRateMode, 0, address(this));
+    }
+
+    /**
+     * @notice Repays a borrowed `amount` on a specific reserve, burning the equivalent debt tokens owned
+     * - E.g. User repays 100 USDC, burning 100 variable/stable debt tokens of the `onBehalfOf` address
+     * @param asset The address of the borrowed underlying asset previously borrowed
+     * @param amount The amount to repay
+     * - Send the value type(uint256).max in order to repay the whole debt for `asset` on the specific `debtMode`
+     * @param interestRateMode The interest rate mode at of the debt the user wants to repay: 1 for Stable, 2 for Variable
+     **/
+    function aaveRepay(
+        address asset,
+        uint256 amount,
+        uint256 interestRateMode
+    ) external onlyTrader nonReentrant whenNotPaused epochActive {
+        if (IERC20(asset).allowance(address(aavePool), address(this)) < amount) {
+            IERC20(asset).safeApprove(address(aavePool), amount);
+        }
+        aavePool.repay(asset, amount, interestRateMode, address(this));
     }
 
     function profitAmount(
